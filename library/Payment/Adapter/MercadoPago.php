@@ -1,8 +1,9 @@
 <?php
 /**
  * Mercado Pago Checkout Pro para FOSSBilling
- * Versão 24/01/2026
- * Créditos: 4TeamBR
+ * Donate: http://url.4teambr.com/paypal
+ * FIX: Previne processamento duplicado e garante ativação do serviço
+ * FEATURE: Sistema de taxas configurável
  */
 
 class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOSSBilling\InjectionAwareInterface
@@ -62,6 +63,27 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
                         'required' => false,
                     ],
                 ],
+                'enable_fees' => [
+                    'radio',
+                    [
+                        'label' => 'Ativar Taxa de Processamento',
+                        'description' => 'Adicionar taxa fixa ao valor da fatura',
+                        'multiOptions' => [
+                            '1' => 'Sim',
+                            '0' => 'Não',
+                        ],
+                        'value' => '0',
+                    ],
+                ],
+                'fee_percentage' => [
+                    'text',
+                    [
+                        'label' => 'Taxa Percentual (%)',
+                        'description' => 'Percentual da taxa a ser adicionado (ex: 5.5 para 5,5%). Usar ponto como separador decimal.',
+                        'required' => false,
+                        'value' => '0.00',
+                    ],
+                ],
             ],
         ];
     }
@@ -78,7 +100,7 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
 
             $paymentUrl = $preference['init_point'];
 			
-			            $logoUrl = !empty($this->config['logo_url']) ? $this->config['logo_url'] : null;
+			$logoUrl = !empty($this->config['logo_url']) ? $this->config['logo_url'] : null;
             
             if (!$logoUrl) {
                  // Use local asset by default
@@ -87,34 +109,133 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             
             $btnContent = "<img src='{$logoUrl}' alt='Mercado Pago' style='max-height:24px; vertical-align:middle; margin-right:10px;'> Pagar com Mercado Pago";
 
+            // Exibe informação sobre taxa se estiver ativa
+            $feeNotice = '';
+            if ($this->isFeesEnabled()) {
+                $invoiceTotal = round((float)$invoice['total'], 2);
+                $feeAmount = $this->calculateFeeAmount($invoiceTotal);
+                $percentage = $this->getFeePercentage();
+                $feeFormatted = number_format($feeAmount, 2, ',', '.');
+                $percentageFormatted = number_format($percentage, 2, ',', '.');
+                $feeNotice = "<p style='margin-top:10px; color:#666; font-size:14px;'>
+                    <em>Taxa de processamento ({$percentageFormatted}%): R$ {$feeFormatted}</em>
+                </p>";
+            }
+
             return "
             <div style='text-align:center; padding:30px;'>
-                <a href='{$paymentUrl}' class='btn btn-primary btn-lg' style='background:#009EE3; padding:18px 50px; font-size:20px;'>
+                <a href='{$paymentUrl}' target='_blank' rel='noopener' class='btn btn-primary btn-lg' style='background:#009EE3; padding:18px 50px; font-size:20px;' id='mp-btn'>
                     {$btnContent}
                 </a>
+                {$feeNotice}
                 <p style='margin-top:15px; color:#666;'>
                     Redirecionando em <strong id='countdown'>3</strong> segundos...
                 </p>
-                <script>
-                    let s = 3;
-                    const redirect = () => window.location.href = '{$paymentUrl}';
-                    setTimeout(redirect, 3000);
-                    setInterval(() => {
-                        const el = document.getElementById('countdown');
-                        if (el && s > 0) el.textContent = --s;
-                    }, 1000);
-                </script>
-            </div>";
+            </div>
+            <div id='mp-modal' style='display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9999;'>
+                <div style='position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#fff; border-radius:8px; width:95%; height:95%; box-shadow:0 4px 20px rgba(0,0,0,0.3); overflow:hidden;'>
+                    <button id='mp-close' style='position:absolute; top:5px; right:10px; background:#e74c3c; color:#fff; border:none; border-radius:50%; width:32px; height:32px; font-size:20px; line-height:1; cursor:pointer; z-index:10;'>&times;</button>
+                    <iframe src='{$paymentUrl}' style='width:100%; height:100%; border:none; border-radius:0 0 8px 8px;'></iframe>
+                </div>
+            </div>
+            <script>
+                let s = 3;
+                const paymentUrl = '{$paymentUrl}';
+                const btn = document.getElementById('mp-btn');
+                const modal = document.getElementById('mp-modal');
+                const closeBtn = document.getElementById('mp-close');
+                let userClicked = false;
+                
+                btn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    userClicked = true;
+                    modal.style.display = 'block';
+                });
+                
+                closeBtn.addEventListener('click', () => {
+                    modal.style.display = 'none';
+                });
+                
+                setTimeout(() => {
+                    if (!userClicked) {
+                        modal.style.display = 'block';
+                    }
+                }, 3000);
+                
+                setInterval(() => {
+                    const el = document.getElementById('countdown');
+                    if (el && s > 0) el.textContent = --s;
+                }, 1000);
+                
+                // Fecha modal clicando fora
+                modal.addEventListener('click', function(e) {
+                    if (e.target === this) {
+                        this.style.display = 'none';
+                    }
+                });
+            </script>";
         } catch (Exception $e) {
             error_log('[MercadoPago] Erro: ' . $e->getMessage());
             return '<div class="alert alert-danger">Erro interno. Tente novamente.</div>';
         }
     }
 
+    /**
+     * Verifica se as taxas estão habilitadas
+     */
+    private function isFeesEnabled(): bool
+    {
+        return !empty($this->config['enable_fees']) && $this->config['enable_fees'] === '1';
+    }
+
+    /**
+     * Obtém o percentual da taxa configurada
+     */
+    private function getFeePercentage(): float
+    {
+        if (!$this->isFeesEnabled()) {
+            return 0.0;
+        }
+
+        $percentage = $this->config['fee_percentage'] ?? '0.00';
+        
+        // Remove possíveis vírgulas e converte para float
+        $percentage = str_replace(',', '.', $percentage);
+        $percentage = (float) $percentage;
+        
+        return max(0.0, min(100.0, $percentage)); // Entre 0 e 100%
+    }
+
+    /**
+     * Calcula o valor total com taxa percentual
+     */
+    private function calculateTotalWithFee(float $invoiceTotal): float
+    {
+        $percentage = $this->getFeePercentage();
+        $feeAmount = ($invoiceTotal * $percentage) / 100;
+        $total = $invoiceTotal + $feeAmount;
+        
+        return round($total, 2);
+    }
+
+    /**
+     * Calcula o valor da taxa em reais
+     */
+    private function calculateFeeAmount(float $invoiceTotal): float
+    {
+        $percentage = $this->getFeePercentage();
+        $feeAmount = ($invoiceTotal * $percentage) / 100;
+        
+        return round($feeAmount, 2);
+    }
+
     private function createPreference($invoice): ?array
     {
         $invoiceId = $invoice['id'];
-        $total = round((float)$invoice['total'], 2);
+        $invoiceTotal = round((float)$invoice['total'], 2);
+        
+        // Aplica taxa se habilitada
+        $total = $this->calculateTotalWithFee($invoiceTotal);
 
         if ($total < 0.50) {
             error_log('[MercadoPago] Valor muito baixo: ' . $total);
@@ -125,9 +246,19 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
         $baseUrl = $tools->url('');
         $webhookUrl = rtrim($baseUrl, '/') . '/ipn.php';
 
+        // Monta descrição do item
+        $itemTitle = "Fatura #{$invoice['nr']}";
+        if ($this->isFeesEnabled() && $this->getFeePercentage() > 0) {
+            $percentage = $this->getFeePercentage();
+            $feeAmount = $this->calculateFeeAmount($invoiceTotal);
+            $percentageFormatted = number_format($percentage, 2, ',', '.');
+            $feeFormatted = number_format($feeAmount, 2, ',', '.');
+            $itemTitle .= " + Taxa {$percentageFormatted}% (R$ {$feeFormatted})";
+        }
+
         $payload = [
             'items' => [[
-                'title' => "Fatura #{$invoice['nr']}",
+                'title' => $itemTitle,
                 'quantity' => 1,
                 'currency_id' => 'BRL',
                 'unit_price' => $total,
@@ -144,6 +275,13 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             'notification_url' => $webhookUrl,
             'external_reference' => "INV_{$invoiceId}",
         ];
+
+        // Log para debug
+        if ($this->isFeesEnabled()) {
+            $percentage = $this->getFeePercentage();
+            $feeAmount = $this->calculateFeeAmount($invoiceTotal);
+            error_log("[MercadoPago] 💰 Taxa aplicada - Original: R$ {$invoiceTotal} | Taxa: {$percentage}% (R$ {$feeAmount}) | Total: R$ {$total}");
+        }
 
         $ch = curl_init('https://api.mercadopago.com/checkout/preferences');
         curl_setopt_array($ch, [
@@ -176,7 +314,6 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
 
         // Filtra apenas pagamentos
         if (strpos($type, 'payment') === false) {
-            error_log('[MercadoPago] ⏭️ Ignorando webhook tipo: ' . $type);
             return;
         }
 
@@ -196,7 +333,6 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
         // 🔒 LOCK DE PROCESSAMENTO - Previne duplicação
         $lockKey = "mp_payment_{$paymentId}";
         if ($this->isLocked($lockKey)) {
-            error_log('[MercadoPago] 🔒 Pagamento já está sendo processado, ignorando duplicata');
             return;
         }
         $this->setLock($lockKey);
@@ -255,9 +391,6 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
                 return;
             }
 
-            // ✅ PAGAMENTO APROVADO - PROCESSAR
-            error_log('[MercadoPago] ✅ Pagamento aprovado! Processando...');
-
             $invoice = $api_admin->invoice_get(['id' => $invoiceId]);
             
             if ($invoice['status'] === 'paid') {
@@ -265,8 +398,7 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
                 return;
             }
 
-            // 1. Registra transação
-            error_log('[MercadoPago] 📝 Criando registro de transação...');
+            // 1. Registra transação (com o valor RECEBIDO do Mercado Pago, incluindo taxa)
             $txn = $api_admin->invoice_transaction_create([
                 'invoice_id' => $invoiceId,
                 'gateway_id' => $gateway_id,
@@ -278,15 +410,31 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             ]);
             error_log('[MercadoPago] ✅ Transação criada: ID #' . $txn);
 
+<<<<<<< Updated upstream
+=======
+            // Log de informação sobre taxa
+            if ($this->isFeesEnabled()) {
+                $percentage = $this->getFeePercentage();
+                $invoiceTotal = round((float)$invoice['total'], 2);
+                $feeAmount = $this->calculateFeeAmount($invoiceTotal);
+                error_log("[MercadoPago] 💵 Taxa configurada: {$percentage}% (R$ {$feeAmount}) | Valor pago: R$ {$payment['transaction_amount']}");
+            }
+
+>>>>>>> Stashed changes
             // 2. Marca fatura como paga (ISSO ATIVA O SERVIÇO AUTOMATICAMENTE)
             error_log('[MercadoPago] 💵 Marcando fatura como paga...');
+
+            // Verifica se o gateway da fatura ainda existe
+            $gatewayCheck = $this->di['db']->load('PayGateway', $gateway_id);
+            if (!$gatewayCheck) {
+                error_log("[MercadoPago] ⚠️ Gateway ID {$gateway_id} não encontrado para Invoice #{$invoiceId}. Verifique se o gateway foi deletado ou se há conflito de e‑mail (ex: comprador usa mesmo e‑mail da conta Mercado Livre).");
+            }
+
             $result = $api_admin->invoice_mark_as_paid([
                 'id' => $invoiceId,
                 'note' => "Pagamento aprovado - Mercado Pago ID: {$paymentId}",
                 'execute' => true  // 🔥 FORÇA EXECUÇÃO DOS HOOKS
             ]);
-            
-            error_log('[MercadoPago] ✅✅✅ FATURA PAGA E SERVIÇO ATIVADO!');
             error_log('[MercadoPago] 📊 Resultado: ' . json_encode($result));
 
         } catch (Exception $e) {

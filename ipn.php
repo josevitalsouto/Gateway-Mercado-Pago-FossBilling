@@ -1,7 +1,7 @@
 <?php
 /**
  * IPN HÍBRIDO - FOSSBilling + Mercado Pago
- * 
+ * Donate: http://url.4teambr.com/paypal
  * FUNCIONAMENTO:
  * - Detecta automaticamente se é Mercado Pago (JSON) ou outro gateway (POST/GET)
  * - Mercado Pago: busca gateway_id do banco, injeta JSON no $_POST
