@@ -1,7 +1,7 @@
 <?php
 /**
  * Mercado Pago Checkout Pro para FOSSBilling
- * Donate: http://url.4teambr.com/paypal
+ * Versão Corrigida - Janeiro 2026
  * FIX: Previne processamento duplicado e garante ativação do serviço
  * FEATURE: Sistema de taxas configurável
  */
@@ -124,56 +124,23 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
 
             return "
             <div style='text-align:center; padding:30px;'>
-                <a href='{$paymentUrl}' target='_blank' rel='noopener' class='btn btn-primary btn-lg' style='background:#009EE3; padding:18px 50px; font-size:20px;' id='mp-btn'>
+                <a href='{$paymentUrl}' class='btn btn-primary btn-lg' style='background:#009EE3; padding:18px 50px; font-size:20px;'>
                     {$btnContent}
                 </a>
                 {$feeNotice}
                 <p style='margin-top:15px; color:#666;'>
                     Redirecionando em <strong id='countdown'>3</strong> segundos...
                 </p>
-            </div>
-            <div id='mp-modal' style='display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:9999;'>
-                <div style='position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#fff; border-radius:8px; width:95%; height:95%; box-shadow:0 4px 20px rgba(0,0,0,0.3); overflow:hidden;'>
-                    <button id='mp-close' style='position:absolute; top:5px; right:10px; background:#e74c3c; color:#fff; border:none; border-radius:50%; width:32px; height:32px; font-size:20px; line-height:1; cursor:pointer; z-index:10;'>&times;</button>
-                    <iframe src='{$paymentUrl}' style='width:100%; height:100%; border:none; border-radius:0 0 8px 8px;'></iframe>
-                </div>
-            </div>
-            <script>
-                let s = 3;
-                const paymentUrl = '{$paymentUrl}';
-                const btn = document.getElementById('mp-btn');
-                const modal = document.getElementById('mp-modal');
-                const closeBtn = document.getElementById('mp-close');
-                let userClicked = false;
-                
-                btn.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    userClicked = true;
-                    modal.style.display = 'block';
-                });
-                
-                closeBtn.addEventListener('click', () => {
-                    modal.style.display = 'none';
-                });
-                
-                setTimeout(() => {
-                    if (!userClicked) {
-                        modal.style.display = 'block';
-                    }
-                }, 3000);
-                
-                setInterval(() => {
-                    const el = document.getElementById('countdown');
-                    if (el && s > 0) el.textContent = --s;
-                }, 1000);
-                
-                // Fecha modal clicando fora
-                modal.addEventListener('click', function(e) {
-                    if (e.target === this) {
-                        this.style.display = 'none';
-                    }
-                });
-            </script>";
+                <script>
+                    let s = 3;
+                    const redirect = () => window.location.href = '{$paymentUrl}';
+                    setTimeout(redirect, 3000);
+                    setInterval(() => {
+                        const el = document.getElementById('countdown');
+                        if (el && s > 0) el.textContent = --s;
+                    }, 1000);
+                </script>
+            </div>";
         } catch (Exception $e) {
             error_log('[MercadoPago] Erro: ' . $e->getMessage());
             return '<div class="alert alert-danger">Erro interno. Tente novamente.</div>';
@@ -244,10 +211,8 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
 
         $tools = $this->di['tools'];
         $baseUrl = $tools->url('');
-        $webhookUrl = rtrim($baseUrl, '/') . '/ipn.php';
-
-        // Monta descrição do item
-        $itemTitle = "Fatura #{$invoice['nr']}";
+        $webhookUrl = rtrim($baseUrl, '/') . '/ipn.php?gateway_id=' . (int) $invoice['gateway_id'] . '&invoice_id=' . (int) $invoiceId;
+        $itemTitle = "Fatura #{$invoice['nr']} [INV_{$invoiceId}]";
         if ($this->isFeesEnabled() && $this->getFeePercentage() > 0) {
             $percentage = $this->getFeePercentage();
             $feeAmount = $this->calculateFeeAmount($invoiceTotal);
@@ -274,6 +239,10 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             'auto_return' => 'approved',
             'notification_url' => $webhookUrl,
             'external_reference' => "INV_{$invoiceId}",
+            'metadata' => [
+                'invoice_id' => (string) $invoiceId,
+                'gateway_id' => (string) $invoice['gateway_id'],
+            ],
         ];
 
         // Log para debug
@@ -281,6 +250,14 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             $percentage = $this->getFeePercentage();
             $feeAmount = $this->calculateFeeAmount($invoiceTotal);
             error_log("[MercadoPago] 💰 Taxa aplicada - Original: R$ {$invoiceTotal} | Taxa: {$percentage}% (R$ {$feeAmount}) | Total: R$ {$total}");
+        }
+
+        // Adiciona expiration date to checkout if configured
+        $tempoExpiracao = (int)($this->config['tempo_expiracao'] ?? 30);
+        if ($tempoExpiracao > 0) {
+            $expiration = (new \DateTime())->add(new \DateInterval("PT{$tempoExpiracao}M"))->format('Y-m-d\TH:i:sP');
+            $payload['date_of_expiration'] = $expiration; // MP expects ISO8601-ish format
+            error_log("[MercadoPago] ⏱ Expiração configurada: {$expiration}");
         }
 
         $ch = curl_init('https://api.mercadopago.com/checkout/preferences');
@@ -346,15 +323,70 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             }
 
             error_log('[MercadoPago] 💰 Status do pagamento: ' . $payment['status']);
+            
+            // Log completo para debug
+            error_log('[MercadoPago] 🔍 Payment completo: ' . json_encode($payment));
+            
+            // Extrai invoice_id de múltiplas fontes (suporta POS/Maquininha)
+            $invoiceId = null;
 
-            // Extrai invoice_id
-            if (!preg_match('/^INV_(\d+)$/', $payment['external_reference'] ?? '', $m)) {
-                error_log('[MercadoPago] ❌ Referência inválida: ' . ($payment['external_reference'] ?? 'VAZIO'));
-                return;
+            // 1. external_reference: INV_123
+            $extRef = $payment['external_reference'] ?? '';
+            if (preg_match('/INV_?0*(\d+)/i', $extRef, $m)) {
+                $invoiceId = (int)$m[1];
+                error_log('[MercadoPago] Invoice via external_reference: ' . $invoiceId);
             }
 
-            $invoiceId = (int)$m[1];
-            error_log('[MercadoPago] 📋 Invoice ID extraído: ' . $invoiceId);
+            // 2. metadata.invoice_id (enviado na criação da preference)
+            if (!$invoiceId && !empty($payment['metadata']['invoice_id'])) {
+                $invoiceId = (int)$payment['metadata']['invoice_id'];
+                error_log('[MercadoPago] Invoice via metadata: ' . $invoiceId);
+            }
+
+            // 3. description ou statement_descriptor contendo INV_
+            if (!$invoiceId) {
+                $desc = ($payment['description'] ?? '') . ' ' . ($payment['statement_descriptor'] ?? '');
+                if (preg_match('/INV_?0*(\d+)/i', $desc, $m)) {
+                    $invoiceId = (int)$m[1];
+                    error_log('[MercadoPago] Invoice via description: ' . $invoiceId);
+                }
+            }
+
+            // 4. Fallback por valor exato (para pagamentos POS/Maquininha)
+            if (!$invoiceId) {
+                $amount = isset($payment['transaction_amount']) ? round((float)$payment['transaction_amount'], 2) : null;
+                if ($amount && $amount > 0) {
+                    $rows = $this->di['db']->getAll(
+                        'SELECT i.id
+                         FROM invoice i
+                         LEFT JOIN (
+                             SELECT invoice_id, SUM(price * quantity) AS subtotal
+                             FROM invoice_item
+                             GROUP BY invoice_id
+                         ) items ON items.invoice_id = i.id
+                         WHERE i.gateway_id = :gw
+                           AND i.status = :st
+                           AND ROUND(COALESCE(items.subtotal, 0), 2) = :amount
+                         ORDER BY i.id DESC
+                         LIMIT 2',
+                        [':gw' => (int)$gateway_id, ':st' => \Model_Invoice::STATUS_UNPAID, ':amount' => $amount]
+                    );
+
+                    if (count($rows) === 1) {
+                        $invoiceId = (int)$rows[0]['id'];
+                        error_log("[MercadoPago] Invoice via fallback por valor (R$ {$amount}): {$invoiceId}");
+                    } elseif (count($rows) > 1) {
+                        error_log("[MercadoPago] ⚠️ Fallback ambíguo: múltiplas faturas com valor R$ {$amount}");
+                    }
+                }
+            }
+
+            if (!$invoiceId) {
+                $operationType = $payment['operation_type'] ?? 'unknown';
+                $pointType = $payment['point_of_interaction']['type'] ?? 'unknown';
+                error_log("[MercadoPago] ❌ Não foi possível identificar a fatura. Ref: '{$extRef}', Tipo: {$operationType}, Point: {$pointType}");
+                return;
+            }
 
             // Verifica se já foi processado
             try {
@@ -410,8 +442,6 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             ]);
             error_log('[MercadoPago] ✅ Transação criada: ID #' . $txn);
 
-<<<<<<< Updated upstream
-=======
             // Log de informação sobre taxa
             if ($this->isFeesEnabled()) {
                 $percentage = $this->getFeePercentage();
@@ -420,14 +450,13 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
                 error_log("[MercadoPago] 💵 Taxa configurada: {$percentage}% (R$ {$feeAmount}) | Valor pago: R$ {$payment['transaction_amount']}");
             }
 
->>>>>>> Stashed changes
             // 2. Marca fatura como paga (ISSO ATIVA O SERVIÇO AUTOMATICAMENTE)
             error_log('[MercadoPago] 💵 Marcando fatura como paga...');
 
             // Verifica se o gateway da fatura ainda existe
-            $gatewayCheck = $this->di['db']->load('PayGateway', $gateway_id);
+            $gatewayCheck = $this->di['db']->load('PayGateway', $invoice['gateway_id']);
             if (!$gatewayCheck) {
-                error_log("[MercadoPago] ⚠️ Gateway ID {$gateway_id} não encontrado para Invoice #{$invoiceId}. Verifique se o gateway foi deletado ou se há conflito de e‑mail (ex: comprador usa mesmo e‑mail da conta Mercado Livre).");
+                error_log("[MercadoPago] ⚠️ Gateway ID {$invoice['gateway_id']} não encontrado para Invoice #{$invoiceId}. Verifique se o gateway foi deletado ou se há conflito de e‑mail (ex: comprador usa mesmo e‑mail da conta Mercado Livre).");
             }
 
             $result = $api_admin->invoice_mark_as_paid([
@@ -454,33 +483,41 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
     }
 
     /**
-     * Sistema de Lock simples usando arquivos
+     * Sistema de Lock atômico usando flock()
+     * @var array<string, resource>
      */
+    private array $lockHandles = [];
+
     private function isLocked(string $key): bool
     {
         $lockFile = sys_get_temp_dir() . '/' . md5($key) . '.lock';
-        
-        if (!file_exists($lockFile)) {
-            return false;
+        $handle = @fopen($lockFile, 'c');
+        if (!$handle) {
+            return true;
         }
-        
-        // Se o lock tem mais de 60 segundos, considera expirado
-        if (time() - filemtime($lockFile) > 60) {
-            @unlink($lockFile);
-            return false;
+
+        if (!flock($handle, LOCK_EX | LOCK_NB)) {
+            fclose($handle);
+            return true;
         }
-        
-        return true;
+
+        $this->lockHandles[$key] = $handle;
+        fwrite($handle, (string)time());
+        return false;
     }
 
     private function setLock(string $key): void
     {
-        $lockFile = sys_get_temp_dir() . '/' . md5($key) . '.lock';
-        file_put_contents($lockFile, time());
+        // Lock already acquired in isLocked()
     }
 
     private function releaseLock(string $key): void
     {
+        if (isset($this->lockHandles[$key])) {
+            flock($this->lockHandles[$key], LOCK_UN);
+            fclose($this->lockHandles[$key]);
+            unset($this->lockHandles[$key]);
+        }
         $lockFile = sys_get_temp_dir() . '/' . md5($key) . '.lock';
         @unlink($lockFile);
     }

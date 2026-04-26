@@ -1,14 +1,11 @@
 <?php
 /**
- * IPN HÍBRIDO - FOSSBilling + Mercado Pago
- * Donate: http://url.4teambr.com/paypal
- * FUNCIONAMENTO:
- * - Detecta automaticamente se é Mercado Pago (JSON) ou outro gateway (POST/GET)
- * - Mercado Pago: busca gateway_id do banco, injeta JSON no $_POST
- * - Outros: funciona normalmente com invoice_id e gateway_id na URL
+ * IPN global para gateways locais e Mercado Pago.
+ * Identifica o gateway de origem antes de repassar para o FOSSBilling.
  */
 
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'load.php';
+
 use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Filesystem\Path;
 
@@ -16,15 +13,171 @@ $di = include Path::join(PATH_ROOT, 'di.php');
 $di['translate']();
 $filesystem = new Filesystem();
 
-// ========================================
-// ETAPA 1: CAPTURA DE HEADERS
-// ========================================
-// Necessário porque Mercado Pago envia X-Signature, X-Request-Id
+function ipn_gateway_by_id($di, int $gatewayId): ?array
+{
+    $gateway = $di['db']->getRow(
+        'SELECT * FROM pay_gateway WHERE id = :id LIMIT 1',
+        [':id' => $gatewayId]
+    );
+
+    return $gateway ?: null;
+}
+
+function ipn_gateway_by_name($di, string $name): ?array
+{
+    $gateway = $di['db']->getRow(
+        'SELECT * FROM pay_gateway WHERE gateway = :name AND enabled = 1 LIMIT 1',
+        [':name' => $name]
+    );
+
+    return $gateway ?: null;
+}
+
+function ipn_gateway_config(array $gateway): array
+{
+    $config = $gateway['config'] ?? null;
+    if (!is_string($config) || $config === '') {
+        return [];
+    }
+
+    $decoded = json_decode($config, true);
+    return is_array($decoded) ? $decoded : [];
+}
+
+function ipn_merge_request_payload(array $payload): void
+{
+    $_POST = array_merge($_POST, $payload);
+    $_REQUEST = array_merge($_REQUEST, $payload);
+}
+
+function ipn_fetch_mercadopago_payment(string $paymentId, string $accessToken): ?array
+{
+    $ch = curl_init("https://api.mercadopago.com/v1/payments/{$paymentId}");
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Authorization: Bearer ' . $accessToken,
+        ],
+        CURLOPT_TIMEOUT => 15,
+    ]);
+
+    $result = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($code !== 200 || !$result) {
+        return null;
+    }
+
+    $decoded = json_decode($result, true);
+    return is_array($decoded) ? $decoded : null;
+}
+
+function ipn_resolve_mp_gateway($di, string $paymentId, ?int $invoiceId): ?array
+{
+    $gateways = $di['db']->getAll(
+        'SELECT * FROM pay_gateway WHERE enabled = 1 AND gateway IN ("MercadoPago", "Pix") ORDER BY id ASC'
+    );
+
+    foreach ($gateways as $gateway) {
+        $config = ipn_gateway_config($gateway);
+        $accessToken = $config['access_token'] ?? null;
+        if (!$accessToken) {
+            continue;
+        }
+
+        $payment = ipn_fetch_mercadopago_payment($paymentId, $accessToken);
+        if (!$payment) {
+            continue;
+        }
+
+        $method = strtolower((string) ($payment['payment_method_id'] ?? ''));
+        $details = is_array($payment['transaction_details'] ?? null) ? $payment['transaction_details'] : [];
+        $isPixPayment = $method === 'pix'
+            || !empty($details['qr_code'])
+            || !empty($details['external_resource_url']);
+        $externalReference = (string) ($payment['external_reference'] ?? '');
+
+        if (($gateway['gateway'] ?? '') === 'Pix') {
+            if ($isPixPayment) {
+                error_log("[IPN] Gateway Pix identificado via payment {$paymentId}");
+                return $gateway;
+            }
+
+            if ($externalReference === '' && $invoiceId) {
+                error_log("[IPN] Gateway Pix selecionado por fallback sem external_reference no payment {$paymentId}");
+                return $gateway;
+            }
+        }
+
+        if (($gateway['gateway'] ?? '') === 'MercadoPago' && !$isPixPayment) {
+            error_log("[IPN] Gateway MercadoPago identificado via payment {$paymentId}");
+            return $gateway;
+        }
+    }
+
+    return null;
+}
+
+function ipn_resolve_gateway($di, ?int $gatewayId, ?int $invoiceId, bool $isMercadoPago, ?string $paymentId): ?array
+{
+    if ($isMercadoPago && $paymentId) {
+        $gateway = ipn_resolve_mp_gateway($di, $paymentId, $invoiceId);
+        if ($gateway) {
+            if ($gatewayId) {
+                $explicitGateway = ipn_gateway_by_id($di, $gatewayId);
+                if ($explicitGateway && (int) $explicitGateway['id'] !== (int) $gateway['id']) {
+                    error_log("[IPN] Gateway explicito #{$explicitGateway['id']} ({$explicitGateway['gateway']}) substituido por #{$gateway['id']} ({$gateway['gateway']}) apos identificar o pagamento");
+                }
+            }
+            return $gateway;
+        }
+    }
+
+    if ($gatewayId) {
+        $gateway = ipn_gateway_by_id($di, $gatewayId);
+        if ($gateway) {
+            error_log("[IPN] Gateway definido explicitamente: #{$gateway['id']} ({$gateway['gateway']})");
+            return $gateway;
+        }
+    }
+
+    if ($invoiceId) {
+        try {
+            $invoice = $di['db']->getRow(
+                'SELECT gateway_id FROM invoice WHERE id = :id LIMIT 1',
+                [':id' => $invoiceId]
+            );
+
+            if (!empty($invoice['gateway_id'])) {
+                $gateway = ipn_gateway_by_id($di, (int) $invoice['gateway_id']);
+                if ($gateway) {
+                    error_log("[IPN] Gateway resolvido pela fatura #{$invoiceId}: #{$gateway['id']} ({$gateway['gateway']})");
+                    return $gateway;
+                }
+            }
+        } catch (Exception $e) {
+            error_log('[IPN] Falha ao consultar gateway da fatura: ' . $e->getMessage());
+        }
+    }
+
+    if ($isMercadoPago) {
+        foreach (['MercadoPago', 'Pix'] as $name) {
+            $gateway = ipn_gateway_by_name($di, $name);
+            if ($gateway) {
+                error_log("[IPN] Fallback para gateway ativo {$name} (#{$gateway['id']})");
+                return $gateway;
+            }
+        }
+    }
+
+    return null;
+}
+
 $headers = [];
 if (function_exists('getallheaders')) {
     $headers = getallheaders();
 } else {
-    // Fallback para servidores sem getallheaders()
     foreach ($_SERVER as $key => $value) {
         if (substr($key, 0, 5) === 'HTTP_') {
             $headerName = str_replace(' ', '-', ucwords(strtolower(str_replace('_', ' ', substr($key, 5)))));
@@ -34,125 +187,79 @@ if (function_exists('getallheaders')) {
 }
 $headers = array_change_key_case($headers, CASE_LOWER);
 
-// ========================================
-// ETAPA 2: LÊ O BODY RAW (JSON)
-// ========================================
 $rawInput = $filesystem->readFile('php://input');
 
-// ========================================
-// ETAPA 3: DETECTA MERCADO PAGO (AMBOS OS FORMATOS)
-// ========================================
 $isMercadoPago = false;
 $mpPaymentId = null;
 
-// FORMATO 1: POST com JSON Body
-// Exemplo: {"type":"payment","action":"payment.created","data":{"id":"123456789"}}
-if (!empty($rawInput)) {
+if ($rawInput !== '') {
     $json = json_decode($rawInput, true);
-    
-    if (json_last_error() === JSON_ERROR_NONE 
+    if (
+        json_last_error() === JSON_ERROR_NONE
         && isset($json['data']['id'])
-        && (isset($json['type']) || isset($json['action']))
-        && (($json['type'] ?? '') === 'payment' || strpos($json['action'] ?? '', 'payment') !== false)) {
-        
+        && (($json['type'] ?? '') === 'payment' || strpos((string) ($json['action'] ?? ''), 'payment') !== false)
+    ) {
         $isMercadoPago = true;
-        $mpPaymentId = $json['data']['id'];
-        
-        // Injeta no $_POST para compatibilidade
-        $_POST = array_merge($_POST, $json);
-        $_REQUEST = array_merge($_REQUEST, $json);
+        $mpPaymentId = (string) $json['data']['id'];
+        ipn_merge_request_payload($json);
     }
 }
 
-// FORMATO 2: GET com Query Params
-// Exemplo: ?id=143368148296&topic=payment
-if (!$isMercadoPago && isset($_GET['id'], $_GET['topic'])) {
-    $topic = $_GET['topic'];
-    
-    // Aceita "payment" ou "merchant_order" (ambos são do MP)
-    if (in_array($topic, ['payment', 'merchant_order'], true)) {
-        $isMercadoPago = true;
-        $mpPaymentId = $_GET['id'];
-        
-        // Converte para formato JSON esperado pelo adapter
-        $simulatedJson = [
-            'type' => $topic,
-            'action' => $topic . '.updated',
-            'data' => ['id' => $mpPaymentId]
-        ];
-        
-        // Injeta no $_POST
-        $_POST = array_merge($_POST, $simulatedJson);
-        $_REQUEST = array_merge($_REQUEST, $simulatedJson);
-        
-        error_log("[IPN] 🔄 Convertido webhook GET para formato JSON");
+if (!$isMercadoPago && isset($_GET['topic']) && in_array($_GET['topic'], ['payment', 'merchant_order'], true)) {
+    $isMercadoPago = true;
+    $mpPaymentId = isset($_GET['resource']) ? (string) $_GET['resource'] : (isset($_GET['id']) ? (string) $_GET['id'] : null);
+
+    if ($mpPaymentId) {
+        ipn_merge_request_payload([
+            'type' => $_GET['topic'],
+            'action' => $_GET['topic'] . '.updated',
+            'data' => ['id' => $mpPaymentId],
+        ]);
+        error_log("[IPN] GET Mercado Pago - resource: {$mpPaymentId}");
     }
 }
 
-// ========================================
-// ETAPA 4: CAPTURA IDs (método padrão)
-// ========================================
-// Para gateways normais: invoice_id e gateway_id vêm na URL
-// Exemplo: ipn.php?invoice_id=87&gateway_id=6
-$invoiceID = $_POST['invoice_id'] ?? $_GET['invoice_id'] ?? $_POST['bb_invoice_id'] ?? $_GET['bb_invoice_id'] ?? null;
-$gatewayID = $_POST['gateway_id'] ?? $_GET['gateway_id'] ?? $_POST['bb_gateway_id'] ?? $_GET['bb_gateway_id'] ?? null;
+error_log('[IPN] GET: ' . json_encode($_GET));
+error_log('[IPN] POST: ' . json_encode($_POST));
 
-// ========================================
-// ETAPA 5: MERCADO PAGO - BUSCA GATEWAY_ID
-// ========================================
-// Como o MP não envia gateway_id, precisamos buscar no banco
-if ($isMercadoPago && empty($gatewayID)) {
-    try {
-        $sql = 'SELECT id FROM pay_gateway WHERE gateway = :name AND enabled = 1 LIMIT 1';
-        $gateway = $di['db']->getRow($sql, [':name' => 'MercadoPago']);
-        
-        if ($gateway && isset($gateway['id'])) {
-            $gatewayID = (int)$gateway['id'];
-        } else {
-            error_log('[IPN] ❌ Gateway MercadoPago não encontrado!');
-            error_log('[IPN] 💡 Verifique se está cadastrado e ATIVO em: Sistema > Pagamentos');
-            http_response_code(500);
-            echo json_encode(['error' => 'Gateway MercadoPago not found or disabled']);
-            exit;
-        }
-    } catch (Exception $e) {
-        error_log('[IPN] ❌ Erro ao buscar gateway: ' . $e->getMessage());
-        http_response_code(500);
-        echo json_encode(['error' => 'Database error']);
+$invoiceID = isset($_POST['invoice_id']) ? (int) $_POST['invoice_id'] : (isset($_GET['invoice_id']) ? (int) $_GET['invoice_id'] : null);
+$gatewayID = isset($_POST['gateway_id']) ? (int) $_POST['gateway_id'] : (isset($_GET['gateway_id']) ? (int) $_GET['gateway_id'] : null);
+
+error_log("[IPN] invoiceID: {$invoiceID} | gatewayID: {$gatewayID}");
+
+// 🔒 Deduplicação atômica: se o Mercado Pago enviou GET+POST simultâneos para o mesmo
+// payment ID, apenas um será processado. Usa flock() em vez de file_exists() para
+// evitar race conditions.
+$ipnLockHandle = null;
+if ($isMercadoPago && $mpPaymentId) {
+    $lockDir = sys_get_temp_dir();
+    $lockFile = $lockDir . '/ipn_mp_' . md5($mpPaymentId) . '.lock';
+    $ipnLockHandle = @fopen($lockFile, 'c');
+
+    if ($ipnLockHandle && !flock($ipnLockHandle, LOCK_EX | LOCK_NB)) {
+        // Outra requisição já está processando este mesmo payment ID
+        error_log("[IPN] ⏭ Duplicado ignorado para payment {$mpPaymentId}");
+        fclose($ipnLockHandle);
+        http_response_code(200);
+        header('Content-type: application/json');
+        echo json_encode(['status' => 'ok', 'skipped' => 'duplicate']);
         exit;
     }
 }
 
-// Atualiza $_GET para compatibilidade com FOSSBilling
-$_GET['bb_invoice_id'] = $invoiceID;
-$_GET['bb_gateway_id'] = $gatewayID;
-
-// ========================================
-// ETAPA 6: LOG DE DEBUG
-// ========================================
-if ($isMercadoPago) {
-    error_log("[IPN] 📋 Invoice ID: " . ($invoiceID ?? 'SERÁ BUSCADO DO PAGAMENTO'));
-    error_log("[IPN] 🔧 Gateway ID: " . ($gatewayID ?? 'NULL'));
-    error_log("[IPN] 🔐 Headers:");
-    error_log("[IPN]    X-Signature: " . (isset($headers['x-signature']) ? '✓' : '✗'));
-    error_log("[IPN]    X-Request-Id: " . (isset($headers['x-request-id']) ? '✓' : '✗'));
+$resolvedGateway = ipn_resolve_gateway($di, $gatewayID, $invoiceID, $isMercadoPago, $mpPaymentId);
+if ($resolvedGateway) {
+    $gatewayID = (int) $resolvedGateway['id'];
+    error_log("[IPN] Gateway final: #{$gatewayID} ({$resolvedGateway['gateway']})");
 }
 
-// ========================================
-// ETAPA 7: VALIDA GATEWAY ID
-// ========================================
 if (empty($gatewayID)) {
-    error_log("[IPN] ❌ Gateway ID não fornecido!");
-    error_log("[IPN] POST: " . json_encode($_POST));
-    error_log("[IPN] GET: " . json_encode($_GET));
+    error_log('[IPN] Gateway ID requerido!');
+    if ($ipnLockHandle) { flock($ipnLockHandle, LOCK_UN); fclose($ipnLockHandle); }
     http_response_code(400);
-    echo json_encode(['error' => 'Gateway ID is required']);
     exit;
 }
 
-// ========================================
-// ETAPA 8: MONTA O IPN
-// ========================================
 $ipn = [
     'skip_validation' => true,
     'invoice_id' => $invoiceID,
@@ -164,39 +271,21 @@ $ipn = [
     'http_raw_post_data' => $rawInput,
 ];
 
-// ========================================
-// ETAPA 9: PROCESSA
-// ========================================
 try {
     $service = $di['mod_service']('invoice', 'transaction');
-    $output = $service->createAndProcess($ipn);
-    $res = ['result' => $output, 'error' => null];
-    
-    if ($isMercadoPago) {
-    }
+    $service->createAndProcess($ipn);
+    error_log("[IPN] Processado gateway #{$gatewayID}");
 } catch (Exception $e) {
-    error_log('[IPN] ❌ ERRO: ' . $e->getMessage());
-    error_log('[IPN] Stack: ' . $e->getTraceAsString());
-    $res = ['result' => null, 'error' => ['message' => $e->getMessage()]];
-    $output = false;
+    error_log('[IPN] ERRO: ' . $e->getMessage());
 }
 
-// ========================================
-// ETAPA 10: REDIRECIONAMENTO (se solicitado)
-// ========================================
-if (isset($_GET['redirect'], $_GET['invoice_hash']) || isset($_GET['bb_redirect'], $_GET['bb_invoice_hash'])) {
-    $hash = $_GET['invoice_hash'] ?? $_GET['bb_invoice_hash'];
-    $url = $di['url']->link('invoice/' . $hash);
-    header("Location: $url");
-    exit;
+// Libera o lock após processamento
+if ($ipnLockHandle) {
+    flock($ipnLockHandle, LOCK_UN);
+    fclose($ipnLockHandle);
 }
 
-// ========================================
-// ETAPA 11: RESPOSTA
-// ========================================
-http_response_code($output ? 200 : 500);
-header('Cache-Control: no-cache, must-revalidate');
-header('Expires: Mon, 26 Jul 1997 05:00:00 GMT');
-header('Content-type: application/json; charset=utf-8');
-echo json_encode($res);
+http_response_code(200);
+header('Content-type: application/json');
+echo json_encode(['status' => 'ok']);
 exit;
